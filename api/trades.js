@@ -39,10 +39,14 @@ async function fetchTradesFromRest(limit = 500) {
   });
 
   if (!res.ok) {
+    // 如果419，则说明是请求过于频繁，直接返回空数组
+    if (res.status === 419) {
+      console.warn('⚠️ 请求过于频繁，直接返回空数组');
+      tradesCache = [];
+      return;
+    }
     const err = await res.text();
-    // throw new Error(`获取历史交易失败: ${err}`);
-    console.error(`获取历史交易失败: ${err}`);
-    return;
+    throw new Error(`获取历史交易失败: ${err}`);
   }
 
   const data = await res.json();
