@@ -1,88 +1,167 @@
+/**
+ * /api/trades
+ * 币安合约交易记录接口（REST 初始化 + WebSocket 实时更新 + 30分钟同步）
+ */
+
 const crypto = require('crypto');
+const WebSocket = require('ws');
 
-// 币安API配置
 const BINANCE_FUTURES_URL = 'https://fapi.binance.com';
-const BINANCE_TESTNET_FUTURES_URL = 'https://testnet.binancefuture.com';
+const BINANCE_STREAM_URL = 'wss://fstream.binance.com/stream';
 
-// 生成币安API签名
+const API_KEY = process.env.BINANCE_API_KEY;
+const SECRET_KEY = process.env.BINANCE_SECRET_KEY;
+
+let tradesCache = [];
+let wsClient = null;
+let initialized = false;
+
+// ========================
+// 签名函数
+// ========================
 function generateSignature(queryString, secretKey) {
-    return crypto
-        .createHmac('sha256', secretKey)
-        .update(queryString)
-        .digest('hex');
+  return crypto.createHmac('sha256', secretKey).update(queryString).digest('hex');
 }
 
-// 获取用户交易记录（合约）
-module.exports = async (req, res) => {
-    // 设置CORS头
-    res.setHeader('Access-Control-Allow-Origin', '*');
-    res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+// ========================
+// 获取历史交易记录（只在启动时 + 每30分钟同步一次）
+// ========================
+async function fetchTradesFromRest(limit = 500) {
+  const timestamp = Date.now();
+  const params = new URLSearchParams({
+    limit: limit.toString(),
+    timestamp: timestamp.toString(),
+  });
+  const signature = generateSignature(params.toString(), SECRET_KEY);
 
-    if (req.method === 'OPTIONS') {
-        return res.status(200).end();
+  const res = await fetch(`${BINANCE_FUTURES_URL}/fapi/v1/userTrades?${params}&signature=${signature}`, {
+    headers: { 'X-MBX-APIKEY': API_KEY },
+  });
+
+  if (!res.ok) {
+    const err = await res.text();
+    throw new Error(`获取历史交易失败: ${err}`);
+  }
+
+  const data = await res.json();
+  // 按时间倒序排序
+  tradesCache = data.sort((a, b) => b.time - a.time);
+  console.log(`✅ 已同步历史交易 ${tradesCache.length} 条`);
+}
+
+// ========================
+// 创建 listenKey
+// ========================
+async function createListenKey() {
+  const res = await fetch(`${BINANCE_FUTURES_URL}/fapi/v1/listenKey`, {
+    method: 'POST',
+    headers: { 'X-MBX-APIKEY': API_KEY },
+  });
+  const data = await res.json();
+  return data.listenKey;
+}
+
+// ========================
+// 启动 WebSocket 用户数据流
+// ========================
+async function startWebSocket() {
+  if (wsClient) return;
+
+  const listenKey = await createListenKey();
+  const ws = new WebSocket(`${BINANCE_STREAM_URL}?streams=${listenKey}`);
+  wsClient = ws;
+
+  ws.on('open', () => console.log('🔗 已连接币安 WebSocket 用户数据流'));
+
+  ws.on('message', (raw) => {
+    const msg = JSON.parse(raw);
+    if (msg?.data?.e === 'ORDER_TRADE_UPDATE') {
+      const o = msg.data.o;
+      if (o.s === 'PUMPUSDT') return;
+
+      const newTrade = {
+        id: o.t,
+        symbol: o.s,
+        side: o.S,
+        price: parseFloat(o.ap),
+        qty: parseFloat(o.q),
+        time: o.T,
+        status: o.X,
+      };
+
+      tradesCache.unshift(newTrade);
+      if (tradesCache.length > 1000) tradesCache = tradesCache.slice(0, 1000);
+      console.log(`💥 新成交: ${o.s} ${o.S} ${o.q}@${o.ap}`);
     }
+  });
 
-    if (req.method !== 'GET') {
-        return res.status(405).json({ error: 'Method not allowed' });
-    }
+  ws.on('close', () => {
+    console.warn('⚠️ WebSocket 关闭，5秒后重连...');
+    wsClient = null;
+    setTimeout(startWebSocket, 5000);
+  });
 
-    const apiKey = process.env.BINANCE_API_KEY;
-    const secretKey = process.env.BINANCE_SECRET_KEY;
-    const useTestnet = process.env.USE_TESTNET === 'true';
+  ws.on('error', (err) => {
+    console.error('❌ WebSocket 错误:', err.message);
+    ws.close();
+  });
 
-    if (!apiKey || !secretKey) {
-        return res.status(500).json({ error: 'API密钥未配置' });
-    }
+  // 每30分钟续期 listenKey
+  setInterval(async () => {
+    await fetch(`${BINANCE_FUTURES_URL}/fapi/v1/listenKey`, {
+      method: 'PUT',
+      headers: { 'X-MBX-APIKEY': API_KEY },
+    });
+    console.log('🔄 已续期 listenKey');
+  }, 30 * 60 * 1000);
+}
 
+// ========================
+// 初始化逻辑（只执行一次）
+// ========================
+async function ensureInitialized() {
+  if (initialized) return;
+  if (!API_KEY || !SECRET_KEY) throw new Error('❌ 缺少 Binance API Key 或 Secret');
+
+  // 第一次初始化：获取历史交易
+  await fetchTradesFromRest();
+  // 开启 WebSocket
+  await startWebSocket();
+  initialized = true;
+
+  // 每30分钟同步一次 REST 数据，更新缓存
+  setInterval(async () => {
     try {
-        const { limit = 25 } = req.query;
-        const baseUrl = useTestnet ? BINANCE_TESTNET_FUTURES_URL : BINANCE_FUTURES_URL;
-
-        // 从币安获取更多记录以确保过滤后仍有足够数量
-        // 如果需要25条,获取100条;如果需要1000条,直接获取1000条
-        const requestLimit = parseInt(limit) <= 100 ? 100 : parseInt(limit);
-        
-        const timestamp = Date.now();
-        const params = new URLSearchParams({
-            limit: requestLimit.toString(),
-            timestamp: timestamp.toString()
-        });
-
-        const queryString = params.toString();
-        const signature = generateSignature(queryString, secretKey);
-
-        const response = await fetch(`${baseUrl}/fapi/v1/userTrades?${queryString}&signature=${signature}`, {
-            headers: {
-                'X-MBX-APIKEY': apiKey
-            }
-        });
-
-        if (!response.ok) {
-            const errorData = await response.json();
-            return res.status(response.status).json({
-                error: '获取交易记录失败',
-                details: errorData
-            });
-        }
-
-        const trades = await response.json();
-
-        // 过滤掉PUMPUSDT交易记录
-        const filteredTrades = trades.filter(trade => trade.symbol !== 'PUMPUSDT');
-
-        // 按时间倒序排列（最新的在前面），然后取指定数量
-        const sortedTrades = filteredTrades
-            .sort((a, b) => b.time - a.time)
-            .slice(0, parseInt(limit));
-
-        res.json(sortedTrades);
-
-    } catch (error) {
-        console.error('交易记录获取失败:', error);
-        res.status(500).json({
-            error: '获取交易记录失败',
-            details: error.message
-        });
+      await fetchTradesFromRest();
+      console.log('🔄 已通过 REST 同步缓存交易数据');
+    } catch (err) {
+      console.error('❌ 每30分钟同步失败:', err.message);
     }
+  }, 30 * 60 * 1000);
+}
+
+// ========================
+// API Handler
+// ========================
+module.exports = async (req, res) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+
+  if (req.method === 'OPTIONS') return res.status(200).end();
+  if (req.method !== 'GET') return res.status(405).json({ error: 'Method not allowed' });
+
+  try {
+    await ensureInitialized();
+    const { limit = 25 } = req.query;
+    const data = tradesCache
+      .filter((t) => t.symbol !== 'PUMPUSDT')
+      .sort((a, b) => b.time - a.time)
+      .slice(0, parseInt(limit));
+
+    res.status(200).json(data);
+  } catch (err) {
+    console.error('❌ /api/trades 错误:', err);
+    res.status(500).json({ error: 'Internal server error', message: err.message });
+  }
 };
