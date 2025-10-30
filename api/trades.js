@@ -40,7 +40,9 @@ async function fetchTradesFromRest(limit = 500) {
 
   if (!res.ok) {
     const err = await res.text();
-    throw new Error(`获取历史交易失败: ${err}`);
+    // throw new Error(`获取历史交易失败: ${err}`);
+    console.error(`获取历史交易失败: ${err}`);
+    return;
   }
 
   const data = await res.json();
